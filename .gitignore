@@ -1,0 +1,23 @@
+# Build outputs
+*.exe
+*.obj
+*.o
+*.pdb
+*.ilk
+
+# Runtime logs
+*.log
+
+# Local configuration / secrets
+.env
+.env.*
+*.pem
+*.key
+credentials*
+secrets*
+
+# Editor / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
