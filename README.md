@@ -116,4 +116,4 @@ Released under the [MIT License](LICENSE).
 
 ## Author
 
-**Oğuz Kağan Akar** · [@oguz-kagan-akar](https://github.com/oguz-kagan-akar)
+**Oğuz Kağan Akar** · [GitHub](https://github.com/oguz-kagan-akar) · [LinkedIn](https://www.linkedin.com/in/oguz-kagan-akar/)
