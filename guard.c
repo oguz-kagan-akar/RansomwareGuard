@@ -24,8 +24,8 @@
  * process can damage some files before an alert fires, and heuristics can
  * produce false positives. This is not a replacement for AV/EDR or backups.
  *
- * Build (MinGW):  x86_64-w64-mingw32-gcc -O2 -Wall -o ransomguard.exe guard.c
- * Build (MSVC):   cl /O2 /W4 guard.c /link /out:ransomguard.exe
+ * Build (MinGW):  x86_64-w64-mingw32-gcc -O2 -Wall -mwindows -o ransomguard.exe guard.c
+ * Build (MSVC):   cl /O2 /W4 guard.c /link /SUBSYSTEM:WINDOWS /out:ransomguard.exe
  */
 
 #define _WIN32_WINNT 0x0601
@@ -45,6 +45,7 @@
 #ifdef _MSC_VER
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "user32.lib")
+#pragma comment(lib, "advapi32.lib")
 #endif
 
 /* ---------------------------------------------------------------- */
@@ -148,6 +149,11 @@ static wchar_t   g_allow[MAX_ALLOW][64];
 static int       g_nallow = 0;
 
 static FILE        *g_log_file = NULL;
+static volatile LONG g_paused = 0;
+static int          g_console_log = 0;
+
+static void TrayAlertState(int alert);
+static void TrayBalloon(const wchar_t *title, const wchar_t *text);
 static ResponseMode g_mode = MODE_SUSPEND;
 static int          g_use_canary = 1, g_use_vault = 1;
 static ULONGLONG    g_vault_bytes = 0;
@@ -182,9 +188,11 @@ static void LogMessage(const char *level, const char *fmt, ...) {
     va_end(args);
 
     EnterCriticalSection(&g_log_lock);
-    fprintf(stdout, "[%04d-%02d-%02d %02d:%02d:%02d] [%s] %s\n",
-            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, level, msg);
-    fflush(stdout);
+    if (g_console_log) {
+        fprintf(stdout, "[%04d-%02d-%02d %02d:%02d:%02d] [%s] %s\n",
+                st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, level, msg);
+        fflush(stdout);
+    }
     if (g_log_file) {
         fprintf(g_log_file, "[%04d-%02d-%02d %02d:%02d:%02d] [%s] %s\n",
                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, level, msg);
@@ -804,6 +812,8 @@ static DWORD WINAPI ResponseThread(LPVOID param) {
     MultiByteToWideChar(CP_UTF8, 0, ctx->why, -1, wwhy, 1024);
     LogMessage("ALERT", "Possible ransomware activity (score %d): %s", ctx->score, ctx->why);
     MessageBeep(MB_ICONEXCLAMATION);
+    TrayAlertState(1);
+    TrayBalloon(L"Possible ransomware activity", wwhy);
 
     DWORD pid = 0;
     wchar_t name[64] = L"";
@@ -886,12 +896,14 @@ static DWORD WINAPI ResponseThread(LPVOID param) {
     CloseHandle(hs);
 
 done:
+    TrayAlertState(0);
     free(ctx);
     InterlockedExchange(&g_response_active, 0);
     return 0;
 }
 
 static void EvaluateHeuristics(void) {
+    if (g_paused) return;
     ULONGLONG now = GetTickCount64();
     if (g_last_alert && now - g_last_alert < ALERT_COOLDOWN_MS) return;
 
@@ -929,6 +941,7 @@ static void CheckFile(const Root *r, const wchar_t *full, const wchar_t *rel,
 }
 
 static void HandleNotification(const Root *r, FILE_NOTIFY_INFORMATION *fni, wchar_t *oldName) {
+    if (g_paused) return;
     wchar_t rel[MAX_PATH], full[PATH_BUF];
     int len = (int)(fni->FileNameLength / sizeof(WCHAR));
     if (len >= MAX_PATH) len = MAX_PATH - 1;
@@ -1043,12 +1056,333 @@ static DWORD WINAPI WatcherThread(LPVOID param) {
 }
 
 /* ---------------------------------------------------------------- */
+/* Settings, install and autostart                                    */
+/* ---------------------------------------------------------------- */
+
+#define WND_CLASS      L"RansomwareGuardTrayWindow"
+#define APP_TITLE      L"RansomwareGuard"
+#define RUN_KEY        L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+#define SETTINGS_KEY   L"Software\\RansomwareGuard"
+#define RUN_VALUE      L"RansomwareGuard"
+#define MUTEX_NAME     L"Local\\RansomwareGuardSingleInstance"
+
+static wchar_t g_persist_args[2048];   /* folder/flag args re-used at every start  */
+static int     g_explicit_roots = 0;
+static int     g_has_console = 0;
+static HWND    g_hwnd = NULL;
+
+static void PersistArg(const wchar_t *a) {
+    size_t n = wcslen(g_persist_args);
+    if (n >= 2000) return;
+    _snwprintf(g_persist_args + n, 2047 - n, L"%ls\"%ls\"", n ? L" " : L"", a);
+    g_persist_args[2047] = L'\0';
+}
+
+static void AttachConsoleIO(void) {
+    if (!AttachConsole(ATTACH_PARENT_PROCESS)) {
+        if (!AllocConsole()) return;
+    }
+    freopen("CONOUT$", "w", stdout);
+    freopen("CONOUT$", "w", stderr);
+    freopen("CONIN$", "r", stdin);
+    SetConsoleOutputCP(CP_UTF8);
+    g_has_console = 1;
+}
+
+/* Console text if a console is attached, otherwise a message box. ASCII only. */
+static void Say(const wchar_t *text, UINT icon) {
+    if (g_has_console) printf("%ls\n", text);
+    else MessageBoxW(NULL, text, APP_TITLE, MB_OK | icon);
+}
+
+static int RegGetDword(const wchar_t *name, DWORD *out) {
+    HKEY k; DWORD type = 0, size = sizeof(DWORD), v = 0;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, SETTINGS_KEY, 0, KEY_READ, &k) != ERROR_SUCCESS) return 0;
+    LONG r = RegQueryValueExW(k, name, NULL, &type, (BYTE *)&v, &size);
+    RegCloseKey(k);
+    if (r != ERROR_SUCCESS || type != REG_DWORD) return 0;
+    *out = v;
+    return 1;
+}
+
+static void RegSetDword(const wchar_t *name, DWORD v) {
+    HKEY k;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, SETTINGS_KEY, 0, NULL, 0, KEY_WRITE, NULL, &k, NULL) != ERROR_SUCCESS) return;
+    RegSetValueExW(k, name, 0, REG_DWORD, (const BYTE *)&v, sizeof(v));
+    RegCloseKey(k);
+}
+
+static void SaveMode(void) { RegSetDword(L"Mode", (DWORD)g_mode); }
+
+static int IsAutostartEnabled(void) {
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_READ, &k) != ERROR_SUCCESS) return 0;
+    LONG r = RegQueryValueExW(k, RUN_VALUE, NULL, NULL, NULL, NULL);
+    RegCloseKey(k);
+    return r == ERROR_SUCCESS;
+}
+
+static int SetAutostart(const wchar_t *exePath) {
+    wchar_t cmd[PATH_BUF + 2100];
+    _snwprintf(cmd, sizeof(cmd) / sizeof(cmd[0]), L"\"%ls\" --background %ls", exePath, g_persist_args);
+    cmd[sizeof(cmd) / sizeof(cmd[0]) - 1] = L'\0';
+    HKEY k;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, NULL, 0, KEY_WRITE, NULL, &k, NULL) != ERROR_SUCCESS) return 0;
+    LONG r = RegSetValueExW(k, RUN_VALUE, 0, REG_SZ, (const BYTE *)cmd, (DWORD)((wcslen(cmd) + 1) * sizeof(wchar_t)));
+    RegCloseKey(k);
+    return r == ERROR_SUCCESS;
+}
+
+static void ClearAutostart(void) {
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_WRITE, &k) != ERROR_SUCCESS) return;
+    RegDeleteValueW(k, RUN_VALUE);
+    RegCloseKey(k);
+}
+
+static void InstalledPath(wchar_t *out, size_t cap) {
+    _snwprintf(out, cap, L"%ls\\ransomguard.exe", g_data_dir);
+    out[cap - 1] = L'\0';
+}
+
+static void StopRunningInstance(void) {
+    HWND w = FindWindowW(WND_CLASS, NULL);
+    if (!w) return;
+    PostMessageW(w, WM_CLOSE, 0, 0);
+    for (int i = 0; i < 40 && FindWindowW(WND_CLASS, NULL); i++) Sleep(100);
+}
+
+/* Returns 0 = failed, 1 = installed and started from the installed copy,
+ * 2 = installed; this process already is the installed copy. */
+static int DoInstall(void) {
+    wchar_t self[PATH_BUF], dest[PATH_BUF];
+    GetModuleFileNameW(NULL, self, PATH_BUF);
+    InstalledPath(dest, PATH_BUF);
+    int same = !_wcsicmp(self, dest);
+
+    if (!same) {
+        StopRunningInstance();
+        int ok = 0;
+        for (int i = 0; i < 10 && !ok; i++) {
+            ok = CopyFileW(self, dest, FALSE);
+            if (!ok) Sleep(300);
+        }
+        if (!ok) return 0;
+    }
+    if (!SetAutostart(dest)) return 0;
+    if (same) return 2;
+
+    wchar_t cmd[PATH_BUF + 2100];
+    _snwprintf(cmd, sizeof(cmd) / sizeof(cmd[0]), L"\"%ls\" --background %ls", dest, g_persist_args);
+    cmd[sizeof(cmd) / sizeof(cmd[0]) - 1] = L'\0';
+    STARTUPINFOW si; PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof(si)); si.cb = sizeof(si);
+    if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) return 0;
+    CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    return 1;
+}
+
+static void DoUninstall(void) {
+    StopRunningInstance();
+    ClearAutostart();
+    wchar_t dest[PATH_BUF];
+    InstalledPath(dest, PATH_BUF);
+    int deleted = 0;
+    for (int i = 0; i < 5 && !deleted; i++) {
+        deleted = DeleteFileW(dest) || GetLastError() == ERROR_FILE_NOT_FOUND;
+        if (!deleted) Sleep(300);
+    }
+    if (!deleted) {
+        /* We are probably running from the installed copy: delete it right after we exit. */
+        wchar_t cmd[PATH_BUF + 100];
+        _snwprintf(cmd, sizeof(cmd) / sizeof(wchar_t),
+                   L"cmd.exe /c ping 127.0.0.1 -n 3 >nul & del /f /q \"%ls\"", dest);
+        cmd[sizeof(cmd) / sizeof(wchar_t) - 1] = L'\0';
+        STARTUPINFOW si; PROCESS_INFORMATION pi;
+        memset(&si, 0, sizeof(si)); si.cb = sizeof(si);
+        if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+            CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+        }
+    }
+    wchar_t msg[PATH_BUF + 200];
+    _snwprintf(msg, PATH_BUF + 200,
+               L"RansomwareGuard was removed from Windows startup and stopped.\n"
+               L"Your vault and log were kept in:\n%ls", g_data_dir);
+    msg[PATH_BUF + 199] = L'\0';
+    Say(msg, MB_ICONINFORMATION);
+}
+
+/* ---------------------------------------------------------------- */
+/* Tray icon                                                          */
+/* ---------------------------------------------------------------- */
+
+#define ICON_SHIELD      MAKEINTRESOURCEW(32518)
+#define ICON_ERROR       MAKEINTRESOURCEW(32513)
+#define ICON_WARN        MAKEINTRESOURCEW(32515)
+#define WM_TRAY          (WM_APP + 1)
+#define ID_PAUSE         1001
+#define ID_MODE_ALERT    1002
+#define ID_MODE_SUSPEND  1003
+#define ID_MODE_KILL     1004
+#define ID_LOG           1005
+#define ID_RESTORE       1006
+#define ID_AUTOSTART     1007
+#define ID_EXIT          1008
+
+static NOTIFYICONDATAW g_nid;
+static UINT g_wm_taskbar = 0;
+static volatile LONG g_tray_alert = 0;
+
+static void TrayTip(wchar_t *dst, size_t cap) {
+    const wchar_t *state = g_tray_alert ? L"ALERT" : (g_paused ? L"paused" : L"protecting");
+    _snwprintf(dst, cap, L"RansomwareGuard - %ls (%d folders)", state, g_nroots);
+    dst[cap - 1] = L'\0';
+}
+
+static void TrayAdd(void) {
+    memset(&g_nid, 0, sizeof(g_nid));
+    g_nid.cbSize = sizeof(g_nid);
+    g_nid.hWnd = g_hwnd;
+    g_nid.uID = 1;
+    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g_nid.uCallbackMessage = WM_TRAY;
+    g_nid.hIcon = LoadIconW(NULL, g_tray_alert ? ICON_ERROR : ICON_SHIELD);
+    TrayTip(g_nid.szTip, sizeof(g_nid.szTip) / sizeof(wchar_t));
+    Shell_NotifyIconW(NIM_ADD, &g_nid);
+}
+
+static void TrayRefresh(void) {
+    if (!g_hwnd) return;
+    g_nid.uFlags = NIF_ICON | NIF_TIP;
+    g_nid.hIcon = LoadIconW(NULL, g_tray_alert ? ICON_ERROR : (g_paused ? ICON_WARN : ICON_SHIELD));
+    TrayTip(g_nid.szTip, sizeof(g_nid.szTip) / sizeof(wchar_t));
+    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+}
+
+static void TrayAlertState(int alert) {
+    InterlockedExchange(&g_tray_alert, alert);
+    TrayRefresh();
+}
+
+static void TrayBalloon(const wchar_t *title, const wchar_t *text) {
+    if (!g_hwnd) return;
+    NOTIFYICONDATAW n = g_nid;
+    n.uFlags = NIF_INFO;
+    n.dwInfoFlags = NIIF_WARNING;
+    wcsncpy(n.szInfoTitle, title, sizeof(n.szInfoTitle) / sizeof(wchar_t) - 1);
+    wcsncpy(n.szInfo, text, sizeof(n.szInfo) / sizeof(wchar_t) - 1);
+    Shell_NotifyIconW(NIM_MODIFY, &n);
+}
+
+static void TrayInfo(const wchar_t *title, const wchar_t *text) {
+    if (!g_hwnd) return;
+    NOTIFYICONDATAW n = g_nid;
+    n.uFlags = NIF_INFO;
+    n.dwInfoFlags = NIIF_INFO;
+    wcsncpy(n.szInfoTitle, title, sizeof(n.szInfoTitle) / sizeof(wchar_t) - 1);
+    wcsncpy(n.szInfo, text, sizeof(n.szInfo) / sizeof(wchar_t) - 1);
+    Shell_NotifyIconW(NIM_MODIFY, &n);
+}
+
+static void ShowTrayMenu(HWND hwnd) {
+    HMENU menu = CreatePopupMenu(), modes = CreatePopupMenu();
+    wchar_t head[128];
+    _snwprintf(head, 128, L"RansomwareGuard - %ls", g_paused ? L"PAUSED" : L"protecting");
+    head[127] = L'\0';
+    AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, head);
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_STRING, ID_PAUSE, g_paused ? L"Resume protection" : L"Pause protection");
+
+    AppendMenuW(modes, MF_STRING | (g_mode == MODE_ALERT ? MF_CHECKED : 0), ID_MODE_ALERT, L"Alert only");
+    AppendMenuW(modes, MF_STRING | (g_mode == MODE_SUSPEND ? MF_CHECKED : 0), ID_MODE_SUSPEND, L"Suspend process (recommended)");
+    AppendMenuW(modes, MF_STRING | (g_mode == MODE_KILL ? MF_CHECKED : 0), ID_MODE_KILL, L"Terminate process");
+    AppendMenuW(menu, MF_POPUP, (UINT_PTR)modes, L"Response mode");
+
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_STRING, ID_LOG, L"Open log");
+    AppendMenuW(menu, MF_STRING, ID_RESTORE, L"Restore files from vault...");
+    AppendMenuW(menu, MF_STRING | (IsAutostartEnabled() ? MF_CHECKED : 0), ID_AUTOSTART, L"Start with Windows");
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_STRING, ID_EXIT, L"Exit");
+
+    POINT pt;
+    GetCursorPos(&pt);
+    SetForegroundWindow(hwnd);
+    TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
+    PostMessageW(hwnd, WM_NULL, 0, 0);
+    DestroyMenu(menu);   /* also destroys the submenu */
+}
+
+static void OnMenuCommand(HWND hwnd, int id) {
+    wchar_t path[PATH_BUF];
+    switch (id) {
+    case ID_PAUSE:
+        InterlockedExchange(&g_paused, !g_paused);
+        LogMessage("INFO", "Protection %s by user", g_paused ? "PAUSED" : "resumed");
+        TrayRefresh();
+        break;
+    case ID_MODE_ALERT:   g_mode = MODE_ALERT;   SaveMode(); LogMessage("INFO", "Mode set to alert"); break;
+    case ID_MODE_SUSPEND: g_mode = MODE_SUSPEND; SaveMode(); LogMessage("INFO", "Mode set to suspend"); break;
+    case ID_MODE_KILL:    g_mode = MODE_KILL;    SaveMode(); LogMessage("INFO", "Mode set to kill"); break;
+    case ID_LOG:
+        _snwprintf(path, PATH_BUF, L"%ls\\%ls", g_data_dir, LOG_FILE_NAME);
+        path[PATH_BUF - 1] = L'\0';
+        ShellExecuteW(NULL, L"open", path, NULL, NULL, SW_SHOWNORMAL);
+        break;
+    case ID_RESTORE: {
+        wchar_t self[PATH_BUF], params[PATH_BUF + 2100];
+        GetModuleFileNameW(NULL, self, PATH_BUF);
+        _snwprintf(params, sizeof(params) / sizeof(wchar_t), L"/k \"\"%ls\" --restore %ls\"", self, g_persist_args);
+        params[sizeof(params) / sizeof(wchar_t) - 1] = L'\0';
+        ShellExecuteW(NULL, L"open", L"cmd.exe", params, NULL, SW_SHOWNORMAL);
+        break;
+    }
+    case ID_AUTOSTART:
+        if (IsAutostartEnabled()) { ClearAutostart(); TrayInfo(APP_TITLE, L"Will no longer start with Windows."); }
+        else {
+            wchar_t self[PATH_BUF];
+            GetModuleFileNameW(NULL, self, PATH_BUF);
+            SetAutostart(self);
+            TrayInfo(APP_TITLE, L"Will start with Windows.");
+        }
+        break;
+    case ID_EXIT:
+        DestroyWindow(hwnd);
+        break;
+    }
+}
+
+static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (g_wm_taskbar && msg == g_wm_taskbar) { TrayAdd(); return 0; }   /* Explorer restarted */
+    switch (msg) {
+    case WM_TRAY:
+        if (lp == WM_RBUTTONUP || lp == WM_LBUTTONUP) ShowTrayMenu(hwnd);
+        return 0;
+    case WM_COMMAND:
+        OnMenuCommand(hwnd, LOWORD(wp));
+        return 0;
+    case WM_QUERYENDSESSION:
+        return TRUE;
+    case WM_ENDSESSION:
+        if (wp) CleanupCanaries();
+        return 0;
+    case WM_DESTROY:
+        Shell_NotifyIconW(NIM_DELETE, &g_nid);
+        LogMessage("INFO", "Exiting, removing canary files");
+        CleanupCanaries();
+        if (g_log_file) fflush(g_log_file);
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+/* ---------------------------------------------------------------- */
 /* Setup                                                              */
 /* ---------------------------------------------------------------- */
 
 static BOOL WINAPI CtrlHandler(DWORD type) {
     (void)type;
-    LogMessage("INFO", "Shutting down, removing canary files");
     CleanupCanaries();
     if (g_log_file) fflush(g_log_file);
     ExitProcess(0);
@@ -1070,12 +1404,13 @@ static void AddRoot(const wchar_t *path) {
     DWORD n = GetFullPathNameW(path, MAX_PATH, full, NULL);
     if (n == 0 || n >= MAX_PATH) return;
     while (n > 3 && full[n - 1] == L'\\') full[--n] = L'\0';
-    if (!IsDirectoryPath(full)) { fwprintf(stderr, L"Not a directory, skipped: %ls\n", full); return; }
+    if (!IsDirectoryPath(full)) { LogMessage("WARN", "Not a directory, skipped"); return; }
     for (int i = 0; i < g_nroots; i++) if (!_wcsicmp(g_roots[i].path, full)) return;
     Root *r = &g_roots[g_nroots++];
     wcscpy(r->path, full);
     _snwprintf(r->vault, PATH_BUF, L"%ls\\vault\\%08x", g_data_dir, FnvHash(full));
     r->vault[PATH_BUF - 1] = L'\0';
+    if (g_explicit_roots) PersistArg(full);
 }
 
 static void AddDefaultRoots(void) {
@@ -1088,8 +1423,11 @@ static void AddDefaultRoots(void) {
 
 static void PrintUsage(void) {
     printf(
-        "RansomwareGuard v0.2\n\n"
+        "RansomwareGuard v0.3 - background ransomware protection\n\n"
         "Usage: ransomguard.exe [options] [folder ...]\n\n"
+        "  (no options)    First run offers to install; then runs with a tray icon\n"
+        "  --install       Copy to %%LOCALAPPDATA%%, start with Windows, run in background\n"
+        "  --uninstall     Stop, remove from startup and delete the installed copy\n"
         "  folder          Folders to protect (default: Documents, Desktop, Pictures)\n"
         "  --mode M        alert | suspend (default) | kill\n"
         "  --allow EXE     Never suspend/terminate this process (repeatable)\n"
@@ -1097,82 +1435,155 @@ static void PrintUsage(void) {
         "  --no-vault      Do not keep last-known-good copies of documents\n"
         "  --restore       Restore missing/encrypted files from the vault and exit\n"
         "  --yes           With --restore: do not ask for confirmation\n"
+        "  --verbose       Also print the log to the console\n"
         "  --help          Show this help\n");
 }
 
-int main(void) {
+int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int show) {
+    (void)hPrev; (void)cmdLine; (void)show;
     int argc = 0;
     wchar_t **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (!argv) return 1;
 
-    int restore = 0, yes = 0;
-    SetConsoleOutputCP(CP_UTF8);
+    int restore = 0, yes = 0, install = 0, uninstall = 0, background = 0, verbose = 0, mode_given = 0;
     InitializeCriticalSection(&g_lock);
     InitializeCriticalSection(&g_log_lock);
     InitializeCriticalSection(&g_proc_lock);
     InitDataDir();
-
-    for (int i = 1; i < argc; i++) {
-        if (!wcscmp(argv[i], L"--help") || !wcscmp(argv[i], L"-h")) { PrintUsage(); return 0; }
-        else if (!wcscmp(argv[i], L"--mode") && i + 1 < argc) {
-            i++;
-            if (!wcscmp(argv[i], L"alert")) g_mode = MODE_ALERT;
-            else if (!wcscmp(argv[i], L"suspend")) g_mode = MODE_SUSPEND;
-            else if (!wcscmp(argv[i], L"kill")) g_mode = MODE_KILL;
-            else { PrintUsage(); return 1; }
-        }
-        else if (!wcscmp(argv[i], L"--allow") && i + 1 < argc) AddAllow(argv[++i]);
-        else if (!wcscmp(argv[i], L"--no-canary")) g_use_canary = 0;
-        else if (!wcscmp(argv[i], L"--no-vault")) g_use_vault = 0;
-        else if (!wcscmp(argv[i], L"--restore")) restore = 1;
-        else if (!wcscmp(argv[i], L"--yes")) yes = 1;
-        else if (!wcsncmp(argv[i], L"--", 2)) { PrintUsage(); return 1; }
-        else AddRoot(argv[i]);
-    }
-    if (g_nroots == 0) AddDefaultRoots();
-    if (g_nroots == 0) { fprintf(stderr, "No valid folders to protect.\n"); return 1; }
-
-    if (restore) return RunRestore(yes);
 
     wchar_t logPath[PATH_BUF];
     _snwprintf(logPath, PATH_BUF, L"%ls\\%ls", g_data_dir, LOG_FILE_NAME);
     logPath[PATH_BUF - 1] = L'\0';
     g_log_file = _wfopen(logPath, L"a");
 
+    DWORD saved;
+    if (RegGetDword(L"Mode", &saved) && saved <= MODE_KILL) g_mode = (ResponseMode)saved;
+
+    /* First pass: flags. Folder args are handled after, so they can be persisted. */
+    for (int i = 1; i < argc; i++) {
+        const wchar_t *a = argv[i];
+        if (!wcscmp(a, L"--help") || !wcscmp(a, L"-h")) { AttachConsoleIO(); PrintUsage(); return 0; }
+        else if (!wcscmp(a, L"--mode") && i + 1 < argc) {
+            i++;
+            mode_given = 1;
+            if (!wcscmp(argv[i], L"alert")) g_mode = MODE_ALERT;
+            else if (!wcscmp(argv[i], L"suspend")) g_mode = MODE_SUSPEND;
+            else if (!wcscmp(argv[i], L"kill")) g_mode = MODE_KILL;
+            else { AttachConsoleIO(); PrintUsage(); return 1; }
+        }
+        else if (!wcscmp(a, L"--allow") && i + 1 < argc) { AddAllow(argv[i + 1]); PersistArg(L"--allow"); PersistArg(argv[i + 1]); i++; }
+        else if (!wcscmp(a, L"--no-canary")) { g_use_canary = 0; PersistArg(a); }
+        else if (!wcscmp(a, L"--no-vault")) { g_use_vault = 0; PersistArg(a); }
+        else if (!wcscmp(a, L"--restore")) restore = 1;
+        else if (!wcscmp(a, L"--yes")) yes = 1;
+        else if (!wcscmp(a, L"--install")) install = 1;
+        else if (!wcscmp(a, L"--uninstall")) uninstall = 1;
+        else if (!wcscmp(a, L"--background")) background = 1;
+        else if (!wcscmp(a, L"--verbose")) verbose = 1;
+        else if (!wcsncmp(a, L"--", 2)) { AttachConsoleIO(); PrintUsage(); return 1; }
+    }
+    if (verbose || restore || install || uninstall) AttachConsoleIO();
+    g_console_log = verbose;
+
+    g_explicit_roots = 1;
+    for (int i = 1; i < argc; i++) {
+        const wchar_t *a = argv[i];
+        if (!wcscmp(a, L"--mode") || !wcscmp(a, L"--allow")) { i++; continue; }
+        if (!wcsncmp(a, L"--", 2)) continue;
+        AddRoot(a);
+    }
+    g_explicit_roots = 0;
+    if (g_nroots == 0) AddDefaultRoots();
+    if (g_nroots == 0) { Say(L"No valid folders to protect.", MB_ICONERROR); return 1; }
+
+    if (uninstall) { DoUninstall(); return 0; }
+    if (restore) return RunRestore(yes);
+    if (install) {
+        if (mode_given) SaveMode();
+        int r = DoInstall();
+        if (r == 0) { Say(L"Installation failed.", MB_ICONERROR); return 1; }
+        Say(L"RansomwareGuard installed. It starts with Windows and runs in the tray (bottom right).", MB_ICONINFORMATION);
+        if (r == 1) return 0;           /* the installed copy is running now */
+        install = 0;                    /* r == 2: we are the installed copy; keep running */
+    }
+
+    /* Double-click on a not-yet-installed copy: offer a one-time install. */
+    if (!background && !install && !IsAutostartEnabled()) {
+        int a = MessageBoxW(NULL,
+            L"Install RansomwareGuard so it runs in the background and starts with Windows?\n\n"
+            L"Yes = install and start (recommended)\nNo = run only this time",
+            APP_TITLE, MB_YESNO | MB_ICONQUESTION);
+        if (a == IDYES) {
+            if (mode_given) SaveMode();
+            int r = DoInstall();
+            if (r == 1) return 0;
+            if (r == 0) MessageBoxW(NULL, L"Installation failed. Running without installing.", APP_TITLE, MB_OK | MB_ICONWARNING);
+        }
+    }
+
+    HANDLE mutex = CreateMutexW(NULL, TRUE, MUTEX_NAME);
+    if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (!background) MessageBoxW(NULL, L"RansomwareGuard is already running (see the tray icon, bottom right).",
+                                     APP_TITLE, MB_OK | MB_ICONINFORMATION);
+        return 0;
+    }
+
     static const char *modeNames[] = { "alert", "suspend", "kill" };
-    LogMessage("INFO", "RansomwareGuard v0.2 starting (mode: %s, alert score >= %d)",
-               modeNames[g_mode], ALERT_SCORE);
+    LogMessage("INFO", "RansomwareGuard v0.3 starting (mode: %s, alert score >= %d)", modeNames[g_mode], ALERT_SCORE);
     for (int i = 0; i < g_nroots; i++) {
         char p[PATH_BUF];
         W2U(g_roots[i].path, p, sizeof(p));
         LogMessage("INFO", "Protecting: %s", p);
     }
 
-    SetConsoleCtrlHandler(CtrlHandler, TRUE);
+    if (verbose) SetConsoleCtrlHandler(CtrlHandler, TRUE);
     if (g_use_canary) {
         for (int i = 0; i < g_nroots; i++) CreateCanaries(&g_roots[i]);
         LogMessage("INFO", "Created %d canary files (removed on exit)", g_ncanaries);
     }
-
     if (g_use_vault) {
         for (int i = 0; i < g_nroots; i++) WalkDir(g_roots[i].vault, 0, SizeCb, &g_vault_bytes);
         HANDLE t = CreateThread(NULL, 0, VaultSeedThread, NULL, 0, NULL);
         if (t) CloseHandle(t);
     }
-
     HANDLE ts = CreateThread(NULL, 0, SamplerThread, NULL, 0, NULL);
     if (ts) CloseHandle(ts);
-
-    HANDLE watchers[MAX_ROOTS];
-    int nw = 0;
     for (int i = 0; i < g_nroots; i++) {
         HANDLE t = CreateThread(NULL, 0, WatcherThread, &g_roots[i], 0, NULL);
-        if (t) watchers[nw++] = t;
+        if (t) CloseHandle(t);
     }
-    LogMessage("INFO", "Monitoring. Press Ctrl+C to stop.");
-    if (nw > 0) WaitForMultipleObjects((DWORD)nw, watchers, TRUE, INFINITE);
 
-    CleanupCanaries();
+    /* Hidden window + tray icon + message loop */
+    g_wm_taskbar = RegisterWindowMessageW(L"TaskbarCreated");
+    WNDCLASSW wc;
+    memset(&wc, 0, sizeof(wc));
+    wc.lpfnWndProc = TrayWndProc;
+    wc.hInstance = hInst;
+    wc.lpszClassName = WND_CLASS;
+    RegisterClassW(&wc);
+    g_hwnd = CreateWindowExW(0, WND_CLASS, APP_TITLE, 0, 0, 0, 0, 0, NULL, NULL, hInst, NULL);
+    if (!g_hwnd) {
+        /* No tray (e.g. no desktop yet): keep protecting without an icon. */
+        LogMessage("ERROR", "Could not create tray window; protection continues without a tray icon");
+        WaitForSingleObject(CreateEventW(NULL, TRUE, FALSE, NULL), INFINITE);
+        return 1;
+    }
+    TrayAdd();
+    if (!background) TrayInfo(APP_TITLE, L"Protection is active. Right-click the tray icon for options.");
+    LogMessage("INFO", "Monitoring in the background (tray icon active)");
+
+    MSG msg;
+    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
     if (g_log_file) fclose(g_log_file);
+    if (mutex) { ReleaseMutex(mutex); CloseHandle(mutex); }
     return 0;
+}
+
+/* Allows building as a console-subsystem program as well (no -mwindows). */
+int main(void) {
+    return WinMain(GetModuleHandleW(NULL), NULL, GetCommandLineA(), SW_SHOWDEFAULT);
 }
