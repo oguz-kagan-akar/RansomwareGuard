@@ -1,97 +1,118 @@
+<div align="center">
+
 # RansomwareGuard
 
-A lightweight Windows ransomware-behavior detection prototype written in C.
+**Behavior-based ransomware detection prototype for Windows, written in C.**
 
-RansomwareGuard monitors a selected directory tree for suspicious file-system activity, including bursts of file modifications and renames to commonly associated extensions. It logs events and raises an alert when configured heuristics are triggered.
+![Language](https://img.shields.io/badge/language-C-00599C?logo=c&logoColor=white)
+![Platform](https://img.shields.io/badge/platform-Windows-0078D6?logo=windows&logoColor=white)
+![Status](https://img.shields.io/badge/status-experimental-orange)
+![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
 
-> **Status:** Experimental prototype — not a replacement for antivirus/EDR, backups, or a production endpoint protection system.
+<img src="assets/RansomwareGuard.png" alt="RansomwareGuard dashboard" width="720">
 
-## Screenshot
+</div>
 
-![RansomwareGuard dashboard](assets/RansomwareGuard.png)
+> [!WARNING]
+> **Experimental prototype.** RansomwareGuard is a detection research project. It is **not** a replacement for antivirus/EDR, offline backups, or a production endpoint protection product.
+
+## Overview
+
+RansomwareGuard watches a directory tree in real time and raises an alert when file-system activity looks like ransomware: sudden bursts of renames or writes, or files renamed to extensions commonly dropped by encryptors. It uses only the Windows API, so there are no external dependencies and it builds as a single C file.
 
 ## Features
 
-- Real-time recursive directory monitoring using the Windows `ReadDirectoryChangesW` API.
-- Heuristic alerts for bursts of file renames and modifications.
-- Checks renamed files for a configurable list of suspicious extensions.
-- Writes events to the console and `ransomguard.log`.
-- Simple response hook (`ResponseAction`) intended for future, carefully tested integrations.
+- **Real-time, recursive monitoring** via the Windows `ReadDirectoryChangesW` API
+- **Burst detection** over a sliding time window for renames and modifications
+- **Suspicious extension matching** against a built-in, case-insensitive list (`.locked`, `.encrypted`, `.crypt`, `.enc`, `.wcry`, `.cerber`, and more)
+- **Overflow handling:** a notification buffer overflow is treated as a high-change-rate warning
+- **Logging** to the console and to `ransomguard.log`
+- **Pluggable response hook:** `ResponseAction()` is the extension point for future, carefully tested actions
 
 ## How detection works
 
-The current implementation uses these heuristics:
+| Heuristic | Default trigger |
+|---|---|
+| Rename burst | 15 or more rename events within 5 seconds |
+| Write burst | 40 or more modification events within 5 seconds |
+| Suspicious extension | A file is renamed to an extension in the built-in list |
+| Notification overflow | A zero-byte notification result (very high change rate) |
 
-- **Rename burst:** 15 or more rename events within a 5-second window.
-- **Write burst:** 40 or more modification events within a 5-second window.
-- **Suspicious extension:** a renamed file ends in an extension from the built-in list, such as `.locked`, `.encrypted`, `.crypt`, or `.enc`.
-- **Notification buffer overflow:** a zero-byte notification result is treated as a high-change-rate warning.
+These are indicators, not proof. Legitimate software (backup tools, build systems, sync clients) can trigger false positives, and ransomware can evade simple rules.
 
-These are simple indicators, not proof of ransomware. Legitimate applications that modify many files can trigger false positives, and ransomware may evade these rules.
+## Getting started
 
-## Requirements
+### Requirements
 
 - Windows
-- A C compiler with Windows API support:
-  - MinGW-w64, or
-  - Microsoft Visual C++ (MSVC)
+- A C compiler with Windows API support: **MinGW-w64** or **MSVC**
 
-## Build
+### Build
 
-### MinGW-w64
-
-From the project directory:
+**MinGW-w64**
 
 ```bash
 x86_64-w64-mingw32-gcc -O2 -Wall -o ransomguard.exe guard.c
 ```
 
-Run this command in a MinGW-w64 environment. If compiling directly on Windows, use the corresponding MinGW terminal/toolchain.
-
-### MSVC
-
-From a Developer Command Prompt:
+**MSVC** (Developer Command Prompt)
 
 ```bat
 cl /O2 /W4 guard.c /link /out:ransomguard.exe
 ```
 
-## Usage
-
-Pass the directory you want to monitor:
+### Run
 
 ```bat
-ransomguard.exe "C:\Users\YourName\Documents"
+ransomguard.exe "C:\Path\To\Monitor"
 ```
 
-If no path is supplied, the program attempts to monitor the current user's profile directory.
+If no path is given, the current user's profile directory (`%USERPROFILE%`) is monitored.
 
-Run it only on systems and directories you are authorized to monitor. Test first with a disposable directory containing non-important files.
+> [!IMPORTANT]
+> Only monitor systems and directories you are authorized to monitor. Test first against a disposable folder that contains no important files.
+
+## Configuration
+
+Thresholds and the extension list are compile-time settings at the top of [`guard.c`](guard.c):
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `TIME_WINDOW_SECONDS` | `5.0` | Sliding window for burst detection |
+| `RENAME_BURST_THRESHOLD` | `15` | Renames per window that trigger an alert |
+| `WRITE_BURST_THRESHOLD` | `40` | Modifications per window that trigger an alert |
+| `MAX_TRACKED_EVENTS` | `4096` | Event ring buffer capacity |
+| `EVENT_BUFFER_SIZE` | `64 KB` | `ReadDirectoryChangesW` buffer size |
+| `LOG_FILE_NAME` | `ransomguard.log` | Log file in the working directory |
+| `SUSPICIOUS_EXTENSIONS[]` | built-in list | Extensions flagged on rename |
 
 ## Logs
 
-The program writes messages to the console and appends them to `ransomguard.log` in its working directory.
+Events are printed to the console and appended to `ransomguard.log` in the working directory. Log files are excluded from version control via `.gitignore`.
 
-## Current limitations
+## Limitations
 
-- **Detection only:** the current `ResponseAction()` logs an alert and plays a beep. It does not stop processes, quarantine files, restore encrypted data, or prevent encryption.
-- **No process attribution:** directory notifications do not identify which process caused a change.
-- **Heuristic-based:** thresholds and extensions can cause false positives or miss other ransomware behavior.
-- **Prototype-level event handling:** this is not a hardened security product and should not be relied on as the only layer of protection.
-- **Testing required:** validate behavior in a disposable test directory before using it for any real monitoring.
+- **Detection only.** On alert, `ResponseAction()` logs the event and plays a system beep. It does not stop processes, quarantine files, or restore data.
+- **No process attribution.** Directory change notifications do not identify the responsible process. Reliable attribution requires ETW or a kernel minifilter driver.
+- **User-mode only.** A fast process can still modify some files before an alert fires.
+- **Heuristic-based.** Thresholds and extensions can produce false positives or miss other ransomware behavior.
 
 ## Roadmap
 
-- [ ] Add configuration for thresholds and suspicious extensions.
-- [ ] Improve event aggregation and alert deduplication.
-- [ ] Add tests using safe, simulated file activity.
-- [ ] Explore reliable process attribution and optional response actions.
-- [ ] Add a settings UI and structured log export.
+- [ ] Runtime configuration for thresholds and extensions
+- [ ] Alert aggregation and deduplication
+- [ ] Automated tests using safe, simulated file activity
+- [ ] Process attribution (ETW) and optional response actions
+- [ ] Settings UI and structured log export (JSON)
 
 ## Contributing
 
-Issues and pull requests are welcome. Please include reproduction steps and test changes in an isolated environment.
+Issues and pull requests are welcome. Please include reproduction steps, and run any tests in an isolated environment with disposable data.
 
 ## License
 
-No license has been specified yet. Until a license is added, assume that standard copyright restrictions apply.
+No license has been specified yet. Until one is added, standard copyright restrictions apply.
+
+## Author
+
+**Oğuz Kağan Akar** · [@oguz-kagan-akar](https://github.com/oguz-kagan-akar)
