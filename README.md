@@ -8,6 +8,7 @@
 ![Platform](https://img.shields.io/badge/platform-Windows-0078D6?logo=windows&logoColor=white)
 ![Status](https://img.shields.io/badge/status-experimental-orange)
 ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
+![License](https://img.shields.io/badge/license-MIT-blue)
 
 <img src="assets/RansomwareGuard.png" alt="RansomwareGuard dashboard" width="720">
 
@@ -111,7 +112,7 @@ Issues and pull requests are welcome. Please include reproduction steps, and run
 
 ## License
 
-No license has been specified yet. Until one is added, standard copyright restrictions apply.
+Released under the [MIT License](LICENSE).
 
 ## Author
 
